@@ -1,0 +1,80 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+struct FToonEyeDirectEvaluation
+{
+	float3 CorneaNormal;
+	float HighlightBand;
+	float IrisParallaxCap;
+	float3 HighlightColor;
+};
+
+float3 GetToonEyeCorneaNormal(in FSubstrateBSDF BSDF)
+{
+	return normalize(OctahedronToUnitVector(saturate(TOON_TYPEDDATA0(BSDF).zw) * 2.0f - 1.0f));
+}
+
+float GetToonEyeIrisMask(in FSubstrateBSDF BSDF)
+{
+	return saturate(TOON_TYPEDDATA1(BSDF).x);
+}
+
+float GetToonEyeIrisDepth(in FSubstrateBSDF BSDF)
+{
+	return saturate(TOON_TYPEDDATA1(BSDF).y);
+}
+
+FToonEyeDirectEvaluation EvaluateToonEyeDirectData(in FSubstrateBSDFContext BSDFContext)
+{
+	FToonEyeDirectEvaluation Result = (FToonEyeDirectEvaluation)0;
+	const float ProfileId = TOON_PROFILEID(BSDFContext.BSDF);
+	const float Type = (float)TOON_TYPE_EYE;
+	const float Region = TOON_MATERIALREGIONID(BSDFContext.BSDF);
+	const FToonProfileEyeData Eye = GetToonEyeProfileData(ProfileId, Type, Region);
+	const float HighlightMask = saturate(TOON_TYPEDDATA0(BSDFContext.BSDF).r);
+	const float Roughness = saturate(TOON_ROUGHNESS(BSDFContext.BSDF));
+	const float3 F0 = saturate(TOON_SPECULARCOLOR(BSDFContext.BSDF));
+	Result.CorneaNormal = GetToonEyeCorneaNormal(BSDFContext.BSDF);
+
+	const float VoH = saturate(dot(BSDFContext.V, BSDFContext.H));
+	const float3 SchlickFresnel = F0 + (1.0f - F0) * pow(1.0f - VoH, 5.0f);
+	const float3 Fresnel = lerp(F0, SchlickFresnel, saturate(Eye.FresnelStrength));
+	const float Width = saturate(Eye.HighlightSize * 0.5f + Roughness * 0.5f);
+	const float NoH = saturate(dot(Result.CorneaNormal, BSDFContext.H));
+	const float NoL = saturate(dot(Result.CorneaNormal, BSDFContext.L));
+	const float HighlightResponse = pow(NoH, exp2(lerp(8.0f, 1.5f, Width)));
+	Result.HighlightBand = ToonProfileSmoothStep(saturate(Eye.HighlightThreshold), Eye.HighlightFeather, HighlightResponse);
+	Result.HighlightColor = Result.HighlightBand * HighlightMask * NoL
+		* max(Eye.HighlightIntensity, 0.0f) * max(Eye.HighlightColor, 0.0f) * Fresnel;
+
+	// A lightweight recessed-iris response is used because the BSDF payload has
+	// no UV/height-gradient contract. It only darkens the iris toward grazing
+	// views and remains independent from the smooth cornea catchlight normal.
+	const float ViewGrazing = saturate(1.0f - abs(dot(BSDFContext.V, Result.CorneaNormal)));
+	Result.IrisParallaxCap = saturate(1.0f - GetToonEyeIrisMask(BSDFContext.BSDF) * GetToonEyeIrisDepth(BSDFContext.BSDF) * ViewGrazing);
+	return Result;
+}
+
+float3 EvaluateToonEyeProfileCelColor(float3 DiffuseColor, in FSubstrateBSDFContext BSDFContext, FShadowTerms ShadowTerms, FSubstrateIntegrationSettings Settings)
+{
+	const float ToonProfileId = TOON_PROFILEID(BSDFContext.BSDF);
+	const float ToonType = (float)TOON_TYPE_EYE;
+	const float Region = TOON_MATERIALREGIONID(BSDFContext.BSDF);
+	const FToonProfileLightingData Lighting = GetToonLightingProfileData(ToonProfileId, ToonType, Region);
+	const FToonEyeDirectEvaluation Eye = EvaluateToonEyeDirectData(BSDFContext);
+	FToonProfileCelEvaluation CelData = BuildToonProfileCelData(DiffuseColor, BSDFContext, ShadowTerms, Lighting);
+	CelData.CelInput = min(CelData.CelInput, Eye.IrisParallaxCap);
+	FinalizeToonProfileCelData(Lighting, ToonProfileId, ToonType, Region, Settings, CelData);
+
+	const uint DebugMode = GetResolvedToonDebugMode(ToonProfileId, ToonType, Region);
+	if (DebugMode == TOON_DEBUG_MODE_EYE_CORNEA_NORMAL) return Eye.CorneaNormal * 0.5f + 0.5f;
+	if (DebugMode == TOON_DEBUG_MODE_EYE_HIGHLIGHT_BAND) return Eye.HighlightBand.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_EYE_IRIS_PARALLAX) return Eye.IrisParallaxCap.xxx;
+	return DebugMode == TOON_DEBUG_MODE_NORMAL ? CelData.ToonColor : EvaluateToonProfileDebugColor(DebugMode, CelData, BSDFContext);
+}
+
+float3 EvaluateToonEyeProfileSpecularColor(in FSubstrateBSDFContext BSDFContext)
+{
+	return EvaluateToonEyeDirectData(BSDFContext).HighlightColor;
+}

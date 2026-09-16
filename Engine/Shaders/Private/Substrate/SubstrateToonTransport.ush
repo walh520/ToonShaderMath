@@ -1,0 +1,187 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+// Toon raster direct response is intentionally not a transport BSDF. This file
+// owns the stable approximation used by ray, reflection and Monte-Carlo paths:
+// styled Lambert diffuse plus bounded isotropic GGX.
+
+uint GetSubstrateToonType(in FSubstrateBSDF BSDF)
+{
+	return ((uint)round(TOON_OVERRIDEFLAGS(BSDF))) & TOON_TYPE_MASK;
+}
+
+float3 ApplyToonProfileSaturation(float3 Color, float Saturation)
+{
+	const float Luma = dot(Color, float3(0.2126f, 0.7152f, 0.0722f));
+	return lerp(Luma.xxx, Color, max(Saturation, 0.0f));
+}
+
+float3 BuildToonStyledAlbedo(float3 DiffuseColor, FToonProfileLightingData Lighting)
+{
+	return max(DiffuseColor * max(Lighting.BaseTint, 0.0f) * max(Lighting.BaseIntensity, 0.0f), 0.0f);
+}
+
+float3 FinalizeToonStyledColor(float3 Color, FToonProfileLightingData Lighting)
+{
+	return max(ApplyToonProfileSaturation(max(Color, 0.0f), Lighting.Saturation), 0.0f);
+}
+
+float3 GetToonStyledAlbedo(in FSubstrateBSDF BSDF)
+{
+	const float Type = (float)GetSubstrateToonType(BSDF);
+	const float Region = TOON_MATERIALREGIONID(BSDF);
+	const FToonProfileLightingData Lighting = GetToonLightingProfileData(TOON_PROFILEID(BSDF), Type, Region);
+	return FinalizeToonStyledColor(BuildToonStyledAlbedo(TOON_DIFFUSEALBEDO(BSDF), Lighting), Lighting);
+}
+
+float GetToonClothAverageBaseEnergyScale(in FSubstrateBSDF BSDF)
+{
+	if (GetSubstrateToonType(BSDF) != TOON_TYPE_CLOTH)
+	{
+		return 1.0f;
+	}
+	const float Type = (float)TOON_TYPE_CLOTH;
+	const FToonProfileClothData Cloth = GetToonClothProfileData(TOON_PROFILEID(BSDF), Type, TOON_MATERIALREGIONID(BSDF));
+	if (!Cloth.bSheenEnabled || Cloth.SheenIntensity <= 0.0f || Cloth.EnergyMode != TOON_CLOTH_ENERGY_MODE_APPROXIMATE_LAYERED)
+	{
+		return 1.0f;
+	}
+	// Transport paths do not evaluate the discontinuous direct-light band. Use
+	// its bounded average coverage so diffuse energy remains stable and unbiased.
+	const float AverageCoverage = saturate(TOON_TYPEDDATA0(BSDF).r);
+	return 1.0f - AverageCoverage;
+}
+
+struct FToonTransportData
+{
+	float3 DiffuseAlbedo;
+	float3 F0;
+	float3 F90;
+	float Roughness;
+};
+
+FToonTransportData GetToonTransportData(in FSubstrateBSDF BSDF)
+{
+	FToonTransportData Result;
+	Result.DiffuseAlbedo = GetToonStyledAlbedo(BSDF) * GetToonClothAverageBaseEnergyScale(BSDF);
+	Result.F0 = saturate(TOON_SPECULARCOLOR(BSDF));
+	if (GetSubstrateToonType(BSDF) == TOON_TYPE_EYE)
+	{
+		// Eye reflection mask is local surface data, so it belongs to the
+		// transport F0 shared by Lumen, MC sampling and Path Tracer.
+		Result.F0 *= saturate(TOON_TYPEDDATA0(BSDF).g);
+	}
+	Result.F90 = F0RGBToMicroOcclusion(Result.F0);
+	Result.Roughness = MakeRoughnessSafe(saturate(TOON_ROUGHNESS(BSDF)));
+	return Result;
+}
+
+#if !SUBSTRATE_TOON_TRANSPORT_DATA_ONLY
+
+struct FToonTransportEval
+{
+	float3 DiffuseBxDF;
+	float3 SpecularBxDF;
+	float DiffusePDF;
+	float SpecularPDF;
+};
+
+FToonTransportEval EvaluateToonTransport(in FSubstrateBSDFContext BSDFContext, FToonTransportData Data)
+{
+	FToonTransportEval Result = (FToonTransportEval)0;
+	const float NoL = saturate(BSDFContext.Context.NoL);
+	const float NoV = saturate(BSDFContext.Context.NoV);
+
+	if (NoL > 0.0f && NoV > 0.0f)
+	{
+		Result.DiffuseBxDF = Diffuse_Lambert(Data.DiffuseAlbedo);
+		Result.DiffusePDF = NoL / PI;
+
+		const float Alpha2 = Pow4(Data.Roughness);
+		const float D = D_GGX(Alpha2, saturate(BSDFContext.Context.NoH));
+	#if SUBSTRATE_SHADING_QUALITY == 0
+		const float Vis = Vis_SmithJointApprox(Alpha2, NoV, NoL);
+	#else
+		const float Vis = Vis_SmithJoint(Alpha2, NoV, NoL);
+	#endif
+		const float3 F = F_Schlick(Data.F0, Data.F90, saturate(BSDFContext.Context.VoH));
+		Result.SpecularBxDF = D * Vis * F;
+
+		const float HalfVectorPDF = VisibleGGXPDF(BSDFContext.TangentV, BSDFContext.TangentH, Alpha2);
+		Result.SpecularPDF = RayPDFToReflectionRayPDF(BSDFContext.Context.VoH, HalfVectorPDF);
+	}
+	return Result;
+}
+
+float GetToonTransportDiffuseSelectionProbability(in FSubstrateBSDFContext BSDFContext, FToonTransportData Data)
+{
+	const float3 SpecularEnergy = ComputeGGXSpecEnergyTermsRGB(Data.Roughness, saturate(BSDFContext.Context.NoV), Data.F0, Data.F90).E;
+	const float DiffuseEnergy = dot(max(Data.DiffuseAlbedo, 0.0f), 1.0f.xxx);
+	const float SpecularEnergySum = dot(max(SpecularEnergy, 0.0f), 1.0f.xxx);
+	return DiffuseEnergy / max(DiffuseEnergy + SpecularEnergySum, 1.0e-6f);
+}
+
+float EvaluateToonTransportPDF(FToonTransportEval Evaluation, bool bAllowDiffuse, bool bAllowSpecular, float DiffuseSelectionProbability)
+{
+	const float DiffuseProbability = bAllowDiffuse ? (bAllowSpecular ? DiffuseSelectionProbability : 1.0f) : 0.0f;
+	const float SpecularProbability = bAllowSpecular ? (bAllowDiffuse ? 1.0f - DiffuseSelectionProbability : 1.0f) : 0.0f;
+	return DiffuseProbability * Evaluation.DiffusePDF + SpecularProbability * Evaluation.SpecularPDF;
+}
+
+struct FToonTransportSample
+{
+	float3 L;
+	float PDF;
+	float3 Weight;
+	bool bSampledSpecular;
+};
+
+FToonTransportSample SampleToonTransport(
+	in FSubstrateBSDFContext BSDFContext,
+	FToonTransportData Data,
+	float2 E,
+	bool bAllowDiffuse,
+	bool bAllowSpecular)
+{
+	FToonTransportSample Result = (FToonTransportSample)0;
+	if (!bAllowDiffuse && !bAllowSpecular)
+	{
+		return Result;
+	}
+
+	const float DiffuseSelectionProbability = bAllowDiffuse && bAllowSpecular
+		? GetToonTransportDiffuseSelectionProbability(BSDFContext, Data)
+		: (bAllowDiffuse ? 1.0f : 0.0f);
+	Result.bSampledSpecular = bAllowSpecular && (!bAllowDiffuse || E.x >= DiffuseSelectionProbability);
+
+	if (bAllowDiffuse && bAllowSpecular)
+	{
+		E.x = Result.bSampledSpecular
+			? (E.x - DiffuseSelectionProbability) / max(1.0f - DiffuseSelectionProbability, 1.0e-6f)
+			: E.x / max(DiffuseSelectionProbability, 1.0e-6f);
+		E.x = min(E.x, 0.99999994f);
+	}
+
+	if (Result.bSampledSpecular)
+	{
+		const float4 TangentH = ImportanceSampleVisibleGGX(E, Pow2(Data.Roughness), BSDFContext.TangentV);
+		const float3 H = mul(TangentH.xyz, BSDFContext.TangentBasis);
+		Result.L = 2.0f * dot(BSDFContext.V, H) * H - BSDFContext.V;
+	}
+	else
+	{
+		const float4 DiffuseSample = CosineSampleHemisphere(E);
+		Result.L = mul(DiffuseSample.xyz, BSDFContext.TangentBasis);
+	}
+
+	BSDFContext.SubstrateUpdateBSDFContext(Result.L);
+	const FToonTransportEval Evaluation = EvaluateToonTransport(BSDFContext, Data);
+	Result.PDF = EvaluateToonTransportPDF(Evaluation, bAllowDiffuse, bAllowSpecular, DiffuseSelectionProbability);
+	const float3 BxDF = (bAllowDiffuse ? Evaluation.DiffuseBxDF : 0.0f.xxx)
+		+ (bAllowSpecular ? Evaluation.SpecularBxDF : 0.0f.xxx);
+	Result.Weight = Result.PDF > 0.0f ? BxDF / Result.PDF : 0.0f.xxx;
+	return Result;
+}
+
+#endif // !SUBSTRATE_TOON_TRANSPORT_DATA_ONLY

@@ -1,0 +1,97 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+float PrepareToonFaceUNorm8ForStorage(float Value)
+{
+	const float QuantizedValue = floor(saturate(Value) * 255.0f + 0.5f);
+	// Keep the typed value inside its target byte's bin. Both truncating and
+	// round-to-nearest pack implementations therefore export the same byte.
+	return min((QuantizedValue + 0.25f) * (1.0f / 255.0f), 1.0f);
+}
+
+float2 PrepareToonFaceUNorm8ForStorage(float2 Value)
+{
+	const float2 QuantizedValue = floor(saturate(Value) * 255.0f + 0.5f);
+	return min((QuantizedValue + 0.25f) * (1.0f / 255.0f), 1.0f);
+}
+
+float ResolveToonFaceUNorm8(float Value)
+{
+	return floor(saturate(Value) * 255.0f + 0.001f) * (1.0f / 255.0f);
+}
+
+float2 ResolveToonFaceUNorm8(float2 Value)
+{
+	return floor(saturate(Value) * 255.0f + 0.001f) * (1.0f / 255.0f);
+}
+
+float3 NormalizeToonFaceDirection(float3 Direction, float3 Fallback)
+{
+	const float LengthSquared = dot(Direction, Direction);
+	return LengthSquared > 0.000001f ? Direction * rsqrt(LengthSquared) : Fallback;
+}
+
+void BuildToonFaceReferenceFrame(float3 FaceForward, out float3 ReferenceRight, out float3 ReferenceUp)
+{
+	const float3 SafeForward = NormalizeToonFaceDirection(FaceForward, float3(1.0f, 0.0f, 0.0f));
+	const float3 ReferenceAxis = abs(SafeForward.z) < 0.999f
+		? float3(0.0f, 0.0f, 1.0f)
+		: float3(0.0f, 1.0f, 0.0f);
+	ReferenceRight = normalize(cross(ReferenceAxis, SafeForward));
+	ReferenceUp = normalize(cross(SafeForward, ReferenceRight));
+}
+
+float3 OrthogonalizeToonFaceRight(float3 FaceForward, float3 FaceRight)
+{
+	const float3 SafeForward = NormalizeToonFaceDirection(FaceForward, float3(1.0f, 0.0f, 0.0f));
+	float3 ReferenceRight;
+	float3 ReferenceUp;
+	BuildToonFaceReferenceFrame(SafeForward, ReferenceRight, ReferenceUp);
+
+	const float3 ProjectedRight = FaceRight - SafeForward * dot(FaceRight, SafeForward);
+	const float ProjectedLengthSquared = dot(ProjectedRight, ProjectedRight);
+	return ProjectedLengthSquared > 0.000001f
+		? ProjectedRight * rsqrt(ProjectedLengthSquared)
+		: ReferenceRight;
+}
+
+// Face Forward is stored as an octahedral direction. One additional signed
+// scalar preserves the supplied Face Right as a roll around that Forward axis.
+// This avoids reconstructing the head frame from the per-pixel UV tangent.
+float EncodeToonFaceRightRoll(float3 FaceForward, float3 FaceRight)
+{
+	const float3 SafeForward = NormalizeToonFaceDirection(FaceForward, float3(1.0f, 0.0f, 0.0f));
+	const float3 SafeRight = OrthogonalizeToonFaceRight(SafeForward, FaceRight);
+	float3 ReferenceRight;
+	float3 ReferenceUp;
+	BuildToonFaceReferenceFrame(SafeForward, ReferenceRight, ReferenceUp);
+
+	const float2 RollCoordinates = float2(dot(SafeRight, ReferenceRight), dot(SafeRight, ReferenceUp));
+	return clamp(atan2(RollCoordinates.y, RollCoordinates.x) / PI, -1.0f, 1.0f);
+}
+
+void DecodeToonFaceFrame(
+	float2 EncodedFaceForward,
+	float FaceRightRoll,
+	out float3 FaceForward,
+	out float3 FaceRight,
+	out float3 FaceUp)
+{
+	const float2 ResolvedFaceForward = ResolveToonFaceUNorm8(EncodedFaceForward);
+	FaceForward = NormalizeToonFaceDirection(
+		OctahedronToUnitVector(ResolvedFaceForward * 2.0f - 1.0f),
+		float3(1.0f, 0.0f, 0.0f));
+
+	float3 ReferenceRight;
+	float3 ReferenceUp;
+	BuildToonFaceReferenceFrame(FaceForward, ReferenceRight, ReferenceUp);
+
+	float RollSin;
+	float RollCos;
+	const float ResolvedFaceRightRoll = ResolveToonFaceUNorm8(clamp(FaceRightRoll, -1.0f, 1.0f) * 0.5f + 0.5f) * 2.0f - 1.0f;
+	sincos(ResolvedFaceRightRoll * PI, RollSin, RollCos);
+	FaceRight = normalize(ReferenceRight * RollCos + ReferenceUp * RollSin);
+	FaceUp = normalize(cross(FaceForward, FaceRight));
+	FaceRight = normalize(cross(FaceUp, FaceForward));
+}

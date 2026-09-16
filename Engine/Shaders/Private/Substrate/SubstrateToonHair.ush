@@ -1,0 +1,85 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+struct FToonHairDirectEvaluation
+{
+	float3 Tangent;
+	float WideBand;
+	float FineBand;
+	float BacklitBand;
+	float3 HighlightColor;
+	float3 BacklitColor;
+	float3 RimColor;
+};
+
+float EvaluateToonHairHighlightBand(float3 Tangent, float3 Normal, float Shift, float Width, float Feather, float Roughness, float3 H)
+{
+	const float3 ShiftedTangent = normalize(Tangent + Normal * Shift);
+	const float Alignment = saturate(1.0f - abs(dot(ShiftedTangent, normalize(H))));
+	const float RoughWidth = saturate(Width + Roughness * (1.0f - Width) * 0.5f);
+	return ToonProfileSmoothStep(1.0f - RoughWidth, Feather, Alignment);
+}
+
+FToonHairDirectEvaluation EvaluateToonHairDirectData(in FSubstrateBSDFContext BSDFContext, FSubstrateIntegrationSettings Settings)
+{
+	FToonHairDirectEvaluation Result = (FToonHairDirectEvaluation)0;
+	const float ProfileId = TOON_PROFILEID(BSDFContext.BSDF);
+	const float Type = (float)TOON_TYPE_HAIR;
+	const float Region = TOON_MATERIALREGIONID(BSDFContext.BSDF);
+	const FToonProfileHairData Hair = GetToonHairProfileData(ProfileId, Type, Region);
+	const FToonProfileSpecularRimData RimProfile = GetToonSpecularRimProfileData(ProfileId, Type, Region);
+	const float4 RuntimeData = TOON_TYPEDDATA0(BSDFContext.BSDF);
+	const float HighlightMask = saturate(RuntimeData.r);
+	const float RimMask = saturate(RuntimeData.g);
+	const float BacklitMask = saturate(TOON_TYPEDDATA1(BSDFContext.BSDF).x);
+	const float Noise = RuntimeData.b * 2.0f - 1.0f;
+	const float HairId = RuntimeData.a;
+	const float Roughness = saturate(TOON_ROUGHNESS(BSDFContext.BSDF));
+	const float3 F0 = saturate(TOON_SPECULARCOLOR(BSDFContext.BSDF));
+	const float3 HairAlbedo = saturate(TOON_DIFFUSEALBEDO(BSDFContext.BSDF));
+	const float TangentPerturbation = Noise * saturate(Hair.StrandNoiseStrength) + HairId * Hair.HairIdShiftStrength;
+	Result.Tangent = normalize(BSDFContext.X + BSDFContext.N * TangentPerturbation);
+
+	Result.WideBand = EvaluateToonHairHighlightBand(BSDFContext.X, BSDFContext.N, Hair.WideShift + TangentPerturbation, Hair.WideWidth, Hair.WideFeather, Roughness, BSDFContext.H);
+	Result.FineBand = Hair.bEnableFineHighlight
+		? EvaluateToonHairHighlightBand(BSDFContext.X, BSDFContext.N, Hair.FineShift + TangentPerturbation, Hair.FineWidth, Hair.FineFeather, Roughness, BSDFContext.H)
+		: 0.0f;
+	const float NoL = saturate(abs(BSDFContext.Context.NoL));
+	const float3 WideTint = lerp(HairAlbedo, 1.0f.xxx, saturate(Hair.WideLightTintWeight));
+	const float3 FineTint = lerp(1.0f.xxx, HairAlbedo, saturate(Hair.FineHairTintWeight));
+	Result.HighlightColor = HighlightMask * NoL * F0 * (
+		Result.WideBand * max(Hair.WideIntensity, 0.0f) * max(Hair.WideColor, 0.0f) * WideTint
+		+ Result.FineBand * max(Hair.FineIntensity, 0.0f) * max(Hair.FineColor, 0.0f) * FineTint);
+
+	if (Settings.bToonDirectionalLight)
+	{
+		const float BackNoL = saturate(-dot(BSDFContext.N, BSDFContext.L));
+		const float ViewFacing = saturate((1.0f - dot(BSDFContext.V, BSDFContext.L)) * 0.5f);
+		const float BacklitInput = BackNoL * lerp(1.0f, ViewFacing, 0.5f);
+		Result.BacklitBand = ToonProfileSmoothStep(saturate(Hair.BacklitThreshold), Hair.BacklitFeather, BacklitInput);
+		Result.BacklitColor = Result.BacklitBand * BacklitMask * max(Hair.BacklitIntensity, 0.0f) * max(Hair.BacklitColor, 0.0f);
+
+		const float ViewRim = pow(saturate(1.0f - BSDFContext.SatNoV), max(RimProfile.RimPower, 0.001f));
+		const float RimInput = ViewRim * lerp(1.0f, BSDFContext.SatNoL, saturate(RimProfile.RimLightAlign));
+		const float RimBand = ToonProfileSmoothStep(saturate(RimProfile.RimThreshold), RimProfile.RimFeather, RimInput);
+		Result.RimColor = RimBand * RimMask * max(RimProfile.RimIntensity, 0.0f) * max(RimProfile.RimColor, 0.0f);
+	}
+	return Result;
+}
+
+float3 EvaluateToonHairDebugColor(uint DebugMode, in FSubstrateBSDFContext BSDFContext, FSubstrateIntegrationSettings Settings, float3 FallbackColor)
+{
+	const FToonHairDirectEvaluation Hair = EvaluateToonHairDirectData(BSDFContext, Settings);
+	if (DebugMode == TOON_DEBUG_MODE_HAIR_TANGENT) return Hair.Tangent * 0.5f + 0.5f;
+	if (DebugMode == TOON_DEBUG_MODE_HAIR_WIDE_BAND) return Hair.WideBand.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_HAIR_FINE_BAND) return Hair.FineBand.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_HAIR_BACKLIT) return Hair.BacklitBand.xxx;
+	return FallbackColor;
+}
+
+float3 EvaluateToonHairProfileSpecularRimColor(in FSubstrateBSDFContext BSDFContext, FSubstrateIntegrationSettings Settings)
+{
+	const FToonHairDirectEvaluation Hair = EvaluateToonHairDirectData(BSDFContext, Settings);
+	return Hair.HighlightColor + Hair.BacklitColor + Hair.RimColor;
+}

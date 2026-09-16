@@ -1,0 +1,379 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#ifndef TOON_PROFILE_COMMON_USH
+#define TOON_PROFILE_COMMON_USH
+
+#include "/Engine/Private/ToonProfileDefinitions.ush"
+
+#ifndef SUBSTRATE_TOON_PROFILE_ENABLED
+#define SUBSTRATE_TOON_PROFILE_ENABLED 1
+#endif
+
+uint ResolveToonType(float ToonType)
+{
+	return min((uint)max(round(ToonType), 0.0f), TOON_PROFILE_TYPE_COUNT - 1u);
+}
+
+uint ResolveToonRegion(float MaterialRegionId)
+{
+	const int RoundedRegion = (int)round(MaterialRegionId);
+	return RoundedRegion >= 0 && RoundedRegion < (int)TOON_PROFILE_REGION_COUNT ? (uint)RoundedRegion : 0u;
+}
+
+uint GetToonProfileRow(float ToonType, float MaterialRegionId)
+{
+	return ResolveToonType(ToonType) * TOON_PROFILE_REGION_COUNT + ResolveToonRegion(MaterialRegionId);
+}
+
+float4 SampleToonProfileSlot(Texture2DArray ToonProfileTexture, SamplerState ToonProfileSampler, float ToonProfileId, float ToonType, float MaterialRegionId, uint SlotIndex)
+{
+	const float U = (0.5f + (float)SlotIndex) / (float)TOON_PROFILE_TEXTURE_SIZE;
+	const float V = (0.5f + (float)GetToonProfileRow(ToonType, MaterialRegionId)) / (float)TOON_PROFILE_TEXTURE_SIZE;
+	const float ProfileLayer = clamp(round(ToonProfileId), 0.0f, 255.0f);
+	return ToonProfileTexture.SampleLevel(ToonProfileSampler, float3(U, V, ProfileLayer), 0);
+}
+
+float4 SampleToonProfileSlot(float ToonProfileId, float ToonType, float MaterialRegionId, uint SlotIndex)
+{
+	return SampleToonProfileSlot(View.ToonProfilesTexture, View.ToonProfilesSampler, ToonProfileId, ToonType, MaterialRegionId, SlotIndex);
+}
+
+struct FToonProfileHeaderData
+{
+	uint ProfileVersion;
+	uint FeatureFlags;
+	uint DebugMode;
+};
+
+struct FToonProfileData
+{
+	bool bOutlineEnabled;
+	float3 OutlineColor;
+	float OutlineOuterWidth;
+	float OutlineInnerWidth;
+	uint OutlineRenderMode;
+	uint OutlineNormalSource;
+	bool bUseAuthoredOutlineVertexData;
+	// Compatibility alias for existing material/shader consumers.
+	float OutlineWidth;
+	float OutlineOpacity;
+	float OutlineDepthThreshold;
+	float OutlineNormalThreshold;
+	float OutlineDepthWeight;
+	float OutlineNormalWeight;
+	float OutlineSmoothing;
+	float OutlineDistanceScale;
+	float OutlineMinDistance;
+	float OutlineMaxDistance;
+};
+
+struct FToonProfileLightingData
+{
+	float3 BaseTint;
+	float BaseIntensity;
+	float3 FirstShadeColor;
+	float FirstShadeStrength;
+	float3 SecondShadeColor;
+	float SecondShadeStrength;
+	float ShadowThreshold;
+	float ShadowFeather;
+	float SecondShadowThreshold;
+	float SecondShadowFeather;
+	float ShadowMapWeight;
+	float ShadowMaskWeight;
+	float ShadingGradeWeight;
+	float LightColorWeight;
+	float RampContrast;
+	float RampOffset;
+	float AdditionalLightWeight;
+	float BackLightWeight;
+	float Saturation;
+	float DitherStrength;
+	float TemporalStability;
+};
+
+struct FToonProfileSpecularRimData
+{
+	float3 SpecularColor;
+	float SpecularIntensity;
+	float SpecularThreshold;
+	float SpecularFeather;
+	float SpecularSize;
+	float3 RimColor;
+	float RimIntensity;
+	float RimThreshold;
+	float RimFeather;
+	float RimPower;
+	float RimLightAlign;
+};
+
+struct FToonProfileIndirectData
+{
+	float AOWeight;
+	float Intensity;
+	float EnvironmentColorWeight;
+	bool bUseAmbientRamp;
+	float HDRWhitePoint;
+	float3 CharacterFillColor;
+	float CharacterFillIntensity;
+	float3 ReflectionTint;
+	float ReflectionIntensity;
+};
+
+struct FToonProfileFaceData
+{
+	bool bFlipFaceSDFByLight;
+	uint FaceSDFMode;
+	float FaceShadowCosineOffset;
+	float FaceShadowFeather;
+	float FaceSDFWeight;
+	float OverheadBlendStart;
+	float OverheadBlendEnd;
+	float TopLightValue;
+	float BottomLightValue;
+	float LocalLightFillWeight;
+	float FaceRealtimeShadowWeight;
+	float NoseShadowStrength;
+	float EyeSocketShadowStrength;
+	float CheekGradeStrength;
+};
+
+struct FToonProfileHairData
+{
+	float3 WideColor;
+	float WideIntensity;
+	float WideShift;
+	float WideWidth;
+	float WideFeather;
+	float StrandNoiseStrength;
+	float3 FineColor;
+	float FineIntensity;
+	float FineShift;
+	float FineWidth;
+	float FineFeather;
+	bool bEnableFineHighlight;
+	float HairIdShiftStrength;
+	float WideLightTintWeight;
+	float FineHairTintWeight;
+	float3 BacklitColor;
+	float BacklitIntensity;
+	float BacklitThreshold;
+	float BacklitFeather;
+};
+
+struct FToonProfileEyeData
+{
+	float3 HighlightColor;
+	float HighlightIntensity;
+	float HighlightThreshold;
+	float HighlightFeather;
+	float HighlightSize;
+	float FresnelStrength;
+};
+
+struct FToonProfileClothData
+{
+	float3 SheenColor;
+	float SheenIntensity;
+	float SheenThreshold;
+	float SheenFeather;
+	float SheenSize;
+	float SheenRoughnessScale;
+	float SheenRoughnessBias;
+	uint EnergyMode;
+	bool bSheenEnabled;
+};
+
+FToonProfileHeaderData GetToonProfileHeaderData(float ToonProfileId, float ToonType, float MaterialRegionId)
+{
+	const float4 H = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_HEADER);
+	FToonProfileHeaderData Result;
+	Result.ProfileVersion = (uint)round(H.x);
+	Result.FeatureFlags = (uint)round(H.y);
+	Result.DebugMode = (uint)round(H.z);
+	return Result;
+}
+
+FToonProfileData GetToonProfileData(float ToonProfileId, float ToonType, float MaterialRegionId)
+{
+	const float4 O0 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_OUTLINE0);
+	const float4 O1 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_OUTLINE1);
+	const float4 O2 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_OUTLINE2);
+	const float4 O3 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_OUTLINE3);
+	FToonProfileData Result;
+	Result.bOutlineEnabled = O0.x > 0.5f;
+	Result.OutlineColor = O0.yzw;
+	Result.OutlineOuterWidth = clamp(O1.x, 0.0f, 32.0f);
+	Result.OutlineInnerWidth = clamp(O3.z, 0.0f, 32.0f);
+	const uint OutlineModeFlags = (uint)max(round(O3.w), 0.0f);
+	Result.OutlineRenderMode = min(OutlineModeFlags & 0x3u, 2u);
+	Result.OutlineNormalSource = (OutlineModeFlags >> 2u) & 0x1u;
+	Result.bUseAuthoredOutlineVertexData = ((OutlineModeFlags >> 3u) & 0x1u) != 0u;
+	Result.OutlineWidth = Result.OutlineOuterWidth;
+	Result.OutlineOpacity = saturate(O1.y);
+	Result.OutlineDepthThreshold = max(O1.z, 0.00001f);
+	Result.OutlineNormalThreshold = saturate(O1.w);
+	Result.OutlineDepthWeight = max(O2.x, 0.0f);
+	Result.OutlineNormalWeight = max(O2.y, 0.0f);
+	Result.OutlineSmoothing = max(O2.z, 0.0f);
+	Result.OutlineDistanceScale = max(O2.w, 0.0f);
+	Result.OutlineMinDistance = max(O3.x, 0.0f);
+	Result.OutlineMaxDistance = max(O3.y, Result.OutlineMinDistance + 0.0001f);
+	return Result;
+}
+
+FToonProfileLightingData GetToonLightingProfileData(float ToonProfileId, float ToonType, float MaterialRegionId)
+{
+	const float4 L0 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_LIGHTING0);
+	const float4 L1 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_LIGHTING1);
+	const float4 L2 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_LIGHTING2);
+	const float4 L3 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_LIGHTING3);
+	const float4 L4 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_LIGHTING4);
+	const float4 L5 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_LIGHTING5);
+	const float4 L6 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_LIGHTING6);
+	FToonProfileLightingData Result;
+	Result.BaseTint = L0.rgb; Result.BaseIntensity = L0.a;
+	Result.FirstShadeColor = L1.rgb; Result.FirstShadeStrength = L1.a;
+	Result.SecondShadeColor = L2.rgb; Result.SecondShadeStrength = L2.a;
+	Result.ShadowThreshold = L3.x; Result.ShadowFeather = L3.y; Result.SecondShadowThreshold = L3.z; Result.SecondShadowFeather = L3.w;
+	Result.ShadowMapWeight = L4.x; Result.ShadowMaskWeight = L4.y; Result.ShadingGradeWeight = L4.z; Result.LightColorWeight = L4.w;
+	Result.RampContrast = L5.x; Result.RampOffset = L5.y; Result.AdditionalLightWeight = L5.z; Result.BackLightWeight = L5.w;
+	Result.Saturation = L6.x; Result.DitherStrength = L6.y; Result.TemporalStability = L6.z;
+	return Result;
+}
+
+FToonProfileSpecularRimData GetToonSpecularRimProfileData(float ToonProfileId, float ToonType, float MaterialRegionId)
+{
+	const float4 S0 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_SPECULAR0);
+	const float4 S1 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_SPECULAR1);
+	const float4 R0 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_RIM0);
+	const float4 R1 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_RIM1);
+	FToonProfileSpecularRimData Result;
+	Result.SpecularColor = S0.rgb; Result.SpecularIntensity = S0.a;
+	Result.SpecularThreshold = S1.x; Result.SpecularFeather = S1.y; Result.SpecularSize = S1.z;
+	Result.RimColor = R0.rgb; Result.RimIntensity = R0.a;
+	Result.RimThreshold = R1.x; Result.RimFeather = R1.y; Result.RimPower = R1.z; Result.RimLightAlign = R1.w;
+	return Result;
+}
+
+FToonProfileIndirectData GetToonIndirectProfileData(float ToonProfileId, float ToonType, float MaterialRegionId)
+{
+	const float4 R = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_REFLECTION0);
+	const float4 I0 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_INDIRECT0);
+	const float4 I1 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_INDIRECT1);
+	const FToonProfileHeaderData Header = GetToonProfileHeaderData(ToonProfileId, ToonType, MaterialRegionId);
+	FToonProfileIndirectData Result;
+	Result.AOWeight = saturate(I0.x); Result.Intensity = max(I0.y, 0.0f); Result.EnvironmentColorWeight = saturate(I0.z); Result.HDRWhitePoint = max(I0.w, 0.0001f);
+	Result.bUseAmbientRamp = (Header.FeatureFlags & TOON_PROFILE_FEATURE_AMBIENT_RAMP_TEXTURE) != 0u;
+	Result.CharacterFillColor = max(I1.rgb, 0.0f); Result.CharacterFillIntensity = max(I1.a, 0.0f);
+	Result.ReflectionTint = max(R.rgb, 0.0f); Result.ReflectionIntensity = max(R.a, 0.0f);
+	return Result;
+}
+
+FToonProfileFaceData GetToonFaceProfileData(float ToonProfileId, float ToonType, float MaterialRegionId)
+{
+	const float4 F0 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_FACE0);
+	const float4 F1 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_FACE1);
+	const float4 F2 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_FACE2);
+	const float4 F3 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_FACE3);
+	FToonProfileFaceData Result;
+	Result.bFlipFaceSDFByLight = F0.x > 0.5f; Result.FaceShadowCosineOffset = clamp(F0.y, -1.0f, 1.0f); Result.FaceShadowFeather = max(F0.z, 0.0f); Result.FaceSDFWeight = saturate(F0.w);
+	Result.FaceRealtimeShadowWeight = F1.x; Result.NoseShadowStrength = F1.y; Result.EyeSocketShadowStrength = F1.z; Result.CheekGradeStrength = F1.w;
+	Result.FaceSDFMode = min((uint)round(F2.x), TOON_FACE_SDF_MODE_REPLACE); Result.OverheadBlendStart = min(saturate(F2.y), 0.9999f); Result.OverheadBlendEnd = max(saturate(F2.z), Result.OverheadBlendStart + 0.0001f); Result.LocalLightFillWeight = saturate(F2.w);
+	Result.TopLightValue = saturate(F3.x); Result.BottomLightValue = saturate(F3.y);
+	return Result;
+}
+
+FToonProfileHairData GetToonHairProfileData(float ToonProfileId, float ToonType, float MaterialRegionId)
+{
+	const float4 H0 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_HAIR0);
+	const float4 H1 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_HAIR1);
+	const float4 H2 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_HAIR2);
+	const float4 H3 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_HAIR3);
+	const float4 B0 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_HAIR_BACKLIT0);
+	const float4 B1 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_HAIR_BACKLIT1);
+	const float4 T0 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_HAIR_TINT);
+	FToonProfileHairData Result;
+	Result.WideColor = H0.rgb; Result.WideIntensity = H0.a; Result.WideShift = H1.x; Result.WideWidth = H1.y; Result.WideFeather = H1.z; Result.StrandNoiseStrength = H1.w;
+	Result.FineColor = H2.rgb; Result.FineIntensity = H2.a; Result.FineShift = H3.x; Result.FineWidth = H3.y; Result.FineFeather = H3.z; Result.bEnableFineHighlight = H3.w > 0.5f;
+	Result.BacklitColor = max(B0.rgb, 0.0f); Result.BacklitIntensity = max(B0.a, 0.0f); Result.BacklitThreshold = saturate(B1.x); Result.BacklitFeather = max(B1.y, 0.0f);
+	Result.HairIdShiftStrength = saturate(B1.z); Result.WideLightTintWeight = saturate(B1.w); Result.FineHairTintWeight = saturate(T0.x);
+	return Result;
+}
+
+FToonProfileEyeData GetToonEyeProfileData(float ToonProfileId, float ToonType, float MaterialRegionId)
+{
+	const float4 E0 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_EYE0);
+	const float4 E1 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_EYE1);
+	FToonProfileEyeData Result;
+	Result.HighlightColor = E0.rgb; Result.HighlightIntensity = E0.a; Result.HighlightThreshold = E1.x; Result.HighlightFeather = E1.y; Result.HighlightSize = E1.z; Result.FresnelStrength = saturate(E1.w);
+	return Result;
+}
+
+FToonProfileClothData GetToonClothProfileData(float ToonProfileId, float ToonType, float MaterialRegionId)
+{
+	const float4 C0 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_CLOTH0);
+	const float4 C1 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_CLOTH1);
+	const float4 C2 = SampleToonProfileSlot(ToonProfileId, ToonType, MaterialRegionId, TOON_PROFILE_SLOT_CLOTH2);
+	FToonProfileClothData Result;
+	Result.SheenColor = C0.rgb; Result.SheenIntensity = C0.a; Result.SheenThreshold = C1.x; Result.SheenFeather = C1.y; Result.SheenSize = C1.z;
+	Result.SheenRoughnessScale = max(C1.w, 0.0f); Result.SheenRoughnessBias = clamp(C2.x, -1.0f, 1.0f); Result.EnergyMode = min((uint)round(C2.y), TOON_CLOTH_ENERGY_MODE_APPROXIMATE_LAYERED); Result.bSheenEnabled = C2.z > 0.5f;
+	return Result;
+}
+
+uint GetResolvedToonDebugMode(float ToonProfileId, float ToonType, float MaterialRegionId)
+{
+	if (View.ToonDebugModeOverride >= 0) { return (uint)min(View.ToonDebugModeOverride, TOON_DEBUG_MODE_MAX); }
+#if SUBSTRATE_TOON_PROFILE_ENABLED
+	return min(GetToonProfileHeaderData(ToonProfileId, ToonType, MaterialRegionId).DebugMode, (uint)TOON_DEBUG_MODE_MAX);
+#else
+	return TOON_DEBUG_MODE_NORMAL;
+#endif
+}
+
+bool IsToonDirectRampTextureEnabled(float ToonProfileId, float ToonType, float MaterialRegionId)
+{
+	return (GetToonProfileHeaderData(ToonProfileId, ToonType, MaterialRegionId).FeatureFlags & TOON_PROFILE_FEATURE_DIRECT_RAMP_TEXTURE) != 0u;
+}
+
+float3 SampleToonStyleRampTexture(float ToonProfileId, float ToonType, float MaterialRegionId, float Input, bool bAmbient)
+{
+	const uint ProfileRow = GetToonProfileRow(ToonType, MaterialRegionId);
+	const uint RampRow = ProfileRow * 2u + (bAmbient ? 1u : 0u);
+	const float V = ((float)RampRow + 0.5f) / (float)TOON_STYLE_RAMP_ROW_COUNT;
+	const float ProfileLayer = clamp(round(ToonProfileId), 0.0f, 255.0f);
+	return max(View.ToonRampTexture.SampleLevel(View.ToonRampSampler, float3(saturate(Input), V, ProfileLayer), 0).rgb, 0.0f);
+}
+
+FToonProfileData GetResolvedToonOutlineProfileData(float ToonProfileId, float ToonType, float MaterialRegionId, float OutlineMask, float OutlineWidthScale)
+{
+	FToonProfileData Result = GetToonProfileData(ToonProfileId, ToonType, MaterialRegionId);
+	Result.OutlineOuterWidth = clamp(Result.OutlineOuterWidth * max(OutlineWidthScale, 0.0f), 0.0f, 32.0f);
+	Result.OutlineInnerWidth = clamp(Result.OutlineInnerWidth * max(OutlineWidthScale, 0.0f), 0.0f, 32.0f);
+	Result.OutlineWidth = Result.OutlineOuterWidth;
+	Result.OutlineOpacity = saturate(Result.OutlineOpacity * saturate(OutlineMask));
+	Result.bOutlineEnabled = Result.bOutlineEnabled && max(Result.OutlineOuterWidth, Result.OutlineInnerWidth) > 0.001f && Result.OutlineOpacity > 0.001f;
+	return Result;
+}
+
+// Shared ToonAuxData decoder used by the automatic global composite and by the
+// optional post-process material interface for custom outline effects. Only R/G
+// carry style identity. B is the legacy Grade compatibility output and A is
+// coverage; neither may influence Profile color or opacity here.
+float4 GetToonOutlineMaterialStyleFromAux(float4 ToonAuxData)
+{
+	const uint PackedClassification = (uint)round(saturate(ToonAuxData.g) * 255.0f);
+	const bool bToonValid = (PackedClassification & (1u << 6u)) != 0u;
+	if (!bToonValid)
+	{
+		return 0.0f;
+	}
+
+	const float ProfileId = round(saturate(ToonAuxData.r) * 255.0f);
+	const float MaterialRegionId = (float)(PackedClassification & 7u);
+	const float ToonType = (float)((PackedClassification >> 3u) & 7u);
+	const FToonProfileData Profile = GetToonProfileData(ProfileId, ToonType, MaterialRegionId);
+	return Profile.bOutlineEnabled ? float4(Profile.OutlineColor, Profile.OutlineOpacity) : 0.0f;
+}
+
+#endif // TOON_PROFILE_COMMON_USH

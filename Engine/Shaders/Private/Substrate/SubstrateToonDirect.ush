@@ -1,0 +1,345 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+static const float TOON_BAND_QUANTIZATION_FLOOR = 1.0f / 255.0f;
+
+float GetToonDerivativeAAWidth(float Value)
+{
+#if defined(PIXELSHADER) && PIXELSHADER
+	return abs(fwidth(Value));
+#else
+	// Ray, compute and other non-derivative paths retain the authored feather.
+	return 0.0f;
+#endif
+}
+
+float ResolveToonBandAAWidth(float Value, float ArtistFeather, float QuantizationFloor)
+{
+	return max(max(max(ArtistFeather, 0.0f), GetToonDerivativeAAWidth(Value)), QuantizationFloor);
+}
+
+float ToonProfileSmoothStepWithWidth(float Threshold, float Width, float Value)
+{
+	const float SafeWidth = max(Width, 0.0001f);
+	return smoothstep(Threshold - SafeWidth, Threshold + SafeWidth, Value);
+}
+
+float ToonProfileSmoothStepQuantized(float Threshold, float ArtistFeather, float QuantizationFloor, float Value)
+{
+	return ToonProfileSmoothStepWithWidth(Threshold, ResolveToonBandAAWidth(Value, ArtistFeather, QuantizationFloor), Value);
+}
+
+float ToonProfileSmoothStep(float Threshold, float ArtistFeather, float Value)
+{
+	return ToonProfileSmoothStepQuantized(Threshold, ArtistFeather, TOON_BAND_QUANTIZATION_FLOOR, Value);
+}
+
+float3 GetToonDiffuseNormal(in FSubstrateBSDF BSDF, float3 ShadingNormal)
+{
+	return ToonHasDiffuseNormal(BSDF)
+		? normalize(OctahedronToUnitVector(saturate(TOON_DIFFUSENORMALOCT(BSDF)) * 2.0f - 1.0f))
+		: ShadingNormal;
+}
+
+float ComputeToonStableNoise(uint2 PixelPosition)
+{
+	const uint Hash = (PixelPosition.x * 1664525u + PixelPosition.y * 1013904223u) ^ (PixelPosition.x * PixelPosition.y);
+	return (float)(Hash & 0x00FFFFFFu) / 16777216.0f;
+}
+
+float ResolveToonStableSurfaceShadow(float NoL, float SurfaceShadow)
+{
+	return lerp(1.0f, saturate(SurfaceShadow), smoothstep(0.02f, 0.25f, saturate(NoL)));
+}
+
+float GetToonBandNoise(FToonProfileLightingData Lighting, FSubstrateIntegrationSettings Settings)
+{
+	const float Noise = lerp(saturate(Settings.ToonTemporalNoise), saturate(Settings.ToonStableNoise), saturate(Lighting.TemporalStability));
+	return (Noise - 0.5f) * saturate(Lighting.DitherStrength);
+}
+
+float3 ResolveToonDirectLightColor(in FSubstrateBSDF BSDF, float3 LightColor, bool bIsLocalLight, float SignedNoL, float SignedNoV)
+{
+	const float ToonType = (float)GetSubstrateToonType(BSDF);
+	const FToonProfileLightingData Lighting = GetToonLightingProfileData(TOON_PROFILEID(BSDF), ToonType, TOON_MATERIALREGIONID(BSDF));
+	const float Luma = max(Luminance(max(LightColor, 0.0f)), 0.0f);
+	const float3 ChromaticLight = lerp(Luma.xxx, max(LightColor, 0.0f), saturate(Lighting.LightColorWeight));
+	const float LocalWeight = bIsLocalLight ? max(Lighting.AdditionalLightWeight, 0.0f) : 1.0f;
+	const float FrameSignedNoL = (uint)ToonType == TOON_TYPE_CLOTH
+		? SignedNoL * (SignedNoV >= 0.0f ? 1.0f : -1.0f)
+		: SignedNoL;
+	const float FrontWeight = smoothstep(-0.05f, 0.05f, FrameSignedNoL);
+	const float HemisphereWeight = lerp(max(Lighting.BackLightWeight, 0.0f), 1.0f, FrontWeight);
+	return ChromaticLight * LocalWeight * HemisphereWeight;
+}
+
+struct FToonProfileCelEvaluation
+{
+	float NoL;
+	float SurfaceShadow;
+	float StableSurfaceShadow;
+	float ShadowMask;
+	float ShadingGradeMask;
+	float CelInput;
+	float SecondToFirst;
+	float FirstToBase;
+	float BandIndex;
+	uint bUseRampTexture;
+	float3 StyledAlbedo;
+	float3 FirstShadeColor;
+	float3 SecondShadeColor;
+	float3 RampColor;
+	float3 ToonColor;
+};
+
+void FinalizeToonProfileCelData(FToonProfileLightingData Lighting, float ToonProfileId, float ToonType, float MaterialRegionId, FSubstrateIntegrationSettings Settings, inout FToonProfileCelEvaluation CelData)
+{
+	const float BandNoise = GetToonBandNoise(Lighting, Settings);
+	CelData.CelInput = saturate(CelData.CelInput);
+	CelData.bUseRampTexture = IsToonDirectRampTextureEnabled(ToonProfileId, ToonType, MaterialRegionId) ? 1u : 0u;
+	// The ramp uses the same screen-space contract as analytic bands. Dither is
+	// still capped to one atlas texel; derivative AA may sample farther apart at
+	// distance to integrate a hard authored ramp instead of shimmering.
+	const float RampTexelWidth = 1.0f / (float)TOON_STYLE_RAMP_RESOLUTION;
+	const float RampArtistFeather = max(Lighting.ShadowFeather, Lighting.SecondShadowFeather);
+	const float RampAAWidth = ResolveToonBandAAWidth(CelData.CelInput, RampArtistFeather, RampTexelWidth);
+	const float RampInput = saturate(CelData.CelInput + BandNoise * min(RampAAWidth, RampTexelWidth));
+	if (CelData.bUseRampTexture != 0u)
+	{
+		const float3 RampCenter = SampleToonStyleRampTexture(ToonProfileId, ToonType, MaterialRegionId, RampInput, false);
+		const float3 RampLow = SampleToonStyleRampTexture(ToonProfileId, ToonType, MaterialRegionId, saturate(RampInput - RampAAWidth), false);
+		const float3 RampHigh = SampleToonStyleRampTexture(ToonProfileId, ToonType, MaterialRegionId, saturate(RampInput + RampAAWidth), false);
+		CelData.RampColor = RampCenter * 0.5f + (RampLow + RampHigh) * 0.25f;
+	}
+	else
+	{
+		CelData.RampColor = 1.0f.xxx;
+	}
+
+	// Each threshold owns its feather/dither width. Sharing the wider feather
+	// would make one band's settings silently move the other boundary.
+	const float FirstBandWidth = ResolveToonBandAAWidth(CelData.CelInput, Lighting.ShadowFeather, TOON_BAND_QUANTIZATION_FLOOR);
+	const float SecondBandWidth = ResolveToonBandAAWidth(CelData.CelInput, Lighting.SecondShadowFeather, TOON_BAND_QUANTIZATION_FLOOR);
+	const float FirstThreshold = Lighting.ShadowThreshold + BandNoise * FirstBandWidth;
+	const float SecondThreshold = Lighting.SecondShadowThreshold + BandNoise * SecondBandWidth;
+	CelData.SecondToFirst = ToonProfileSmoothStepWithWidth(SecondThreshold, SecondBandWidth, CelData.CelInput);
+	CelData.FirstToBase = ToonProfileSmoothStepWithWidth(FirstThreshold, FirstBandWidth, CelData.CelInput);
+	CelData.BandIndex = CelData.CelInput >= FirstThreshold ? 2.0f : (CelData.CelInput >= SecondThreshold ? 1.0f : 0.0f);
+
+	if (CelData.bUseRampTexture != 0u)
+	{
+		CelData.ToonColor = CelData.StyledAlbedo * CelData.RampColor;
+	}
+	else
+	{
+		CelData.ToonColor = lerp(CelData.SecondShadeColor, CelData.FirstShadeColor, CelData.SecondToFirst);
+		CelData.ToonColor = lerp(CelData.ToonColor, CelData.StyledAlbedo, CelData.FirstToBase);
+	}
+	CelData.ToonColor = FinalizeToonStyledColor(CelData.ToonColor, Lighting);
+}
+
+FToonProfileCelEvaluation BuildToonProfileCelData(float3 DiffuseColor, in FSubstrateBSDFContext BSDFContext, FShadowTerms ShadowTerms, FToonProfileLightingData Lighting)
+{
+	FToonProfileCelEvaluation Result = (FToonProfileCelEvaluation)0;
+	const float3 DiffuseNormal = GetToonDiffuseNormal(BSDFContext.BSDF, BSDFContext.N);
+	const float SignedNoL = dot(DiffuseNormal, BSDFContext.L);
+	// The signed-hemisphere weight is applied exactly once by
+	// ResolveToonDirectLightColor. Most types use the absolute cosine so an
+	// authored back light mirrors band placement. Cloth instead flips its whole
+	// frame toward the viewer and keeps NoL signed in that resolved frame.
+	const bool bCloth = GetSubstrateToonType(BSDFContext.BSDF) == TOON_TYPE_CLOTH;
+	const float ClothFrameSign = dot(DiffuseNormal, BSDFContext.V) >= 0.0f ? 1.0f : -1.0f;
+	Result.NoL = bCloth ? saturate(SignedNoL * ClothFrameSign) : saturate(abs(SignedNoL));
+	Result.SurfaceShadow = saturate(ShadowTerms.SurfaceShadow);
+	Result.StableSurfaceShadow = ResolveToonStableSurfaceShadow(Result.NoL, Result.SurfaceShadow);
+	Result.ShadowMask = saturate(TOON_SHADOWMASK(BSDFContext.BSDF));
+	Result.ShadingGradeMask = saturate(TOON_SHADINGGRADEMASK(BSDFContext.BSDF));
+	Result.StyledAlbedo = BuildToonStyledAlbedo(DiffuseColor, Lighting);
+	Result.FirstShadeColor = Result.StyledAlbedo * max(Lighting.FirstShadeColor, 0.0f) * max(Lighting.FirstShadeStrength, 0.0f);
+	Result.SecondShadeColor = Result.StyledAlbedo * max(Lighting.SecondShadeColor, 0.0f) * max(Lighting.SecondShadeStrength, 0.0f);
+	Result.CelInput = Result.NoL;
+	// Face owns its real-time shadow policy in the specialization step. Other
+	// types consume the common profile ShadowMapWeight exactly once here.
+	const float CommonShadowMapWeight = GetSubstrateToonType(BSDFContext.BSDF) == TOON_TYPE_FACE ? 0.0f : saturate(Lighting.ShadowMapWeight);
+	Result.CelInput *= lerp(1.0f, Result.StableSurfaceShadow, CommonShadowMapWeight);
+	Result.CelInput *= lerp(1.0f, Result.ShadowMask, saturate(Lighting.ShadowMaskWeight));
+	Result.CelInput = lerp(Result.CelInput, min(Result.CelInput, Result.ShadingGradeMask), saturate(Lighting.ShadingGradeWeight));
+	Result.CelInput = saturate((Result.CelInput - 0.5f) * max(Lighting.RampContrast, 0.0f) + 0.5f + Lighting.RampOffset);
+	return Result;
+}
+
+float3 ToonProfileIdToDebugColor(float Value)
+{
+	const float Seed = max(Value, 0.0f) + 1.0f;
+	return 0.25f + 0.75f * frac(Seed * float3(0.1031f, 0.3713f, 0.719f) + float3(0.11f, 0.23f, 0.37f));
+}
+
+float3 EvaluateToonProfileDebugColor(uint DebugMode, FToonProfileCelEvaluation CelData, in FSubstrateBSDFContext BSDFContext)
+{
+	if (DebugMode == TOON_DEBUG_MODE_NDOTL) return CelData.NoL.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_SURFACE_SHADOW) return CelData.SurfaceShadow.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_SHADOW_MASK) return CelData.ShadowMask.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_CEL_INPUT) return CelData.CelInput.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_TOON_BAND) return CelData.ToonColor;
+	if (DebugMode == TOON_DEBUG_MODE_PROFILE_ID) return ToonProfileIdToDebugColor(TOON_PROFILEID(BSDFContext.BSDF));
+	if (DebugMode == TOON_DEBUG_MODE_MATERIAL_REGION_ID) return ToonProfileIdToDebugColor(TOON_MATERIALREGIONID(BSDFContext.BSDF));
+	if (DebugMode == TOON_DEBUG_MODE_RUNTIME_IDENTITY)
+	{
+		return float3(
+			saturate(TOON_PROFILEID(BSDFContext.BSDF) / 255.0f),
+			saturate(TOON_MATERIALREGIONID(BSDFContext.BSDF) / max((float)TOON_PROFILE_REGION_COUNT - 1.0f, 1.0f)),
+			saturate((float)GetSubstrateToonType(BSDFContext.BSDF) / max((float)TOON_PROFILE_TYPE_COUNT - 1.0f, 1.0f)));
+	}
+	if (DebugMode == TOON_DEBUG_MODE_RUNTIME_MASKS)
+	{
+		return saturate(float3(
+			TOON_SHADOWMASK(BSDFContext.BSDF),
+			TOON_SHADINGGRADEMASK(BSDFContext.BSDF),
+			TOON_OUTLINEMASK(BSDFContext.BSDF)));
+	}
+	if (DebugMode == TOON_DEBUG_MODE_RUNTIME_OUTLINE_WIDTH) return saturate(TOON_OUTLINEWIDTHSCALE(BSDFContext.BSDF) / 6.0f).xxx;
+#if SUBSTRATE_COMPLEXPATH
+	if (DebugMode == TOON_DEBUG_MODE_RUNTIME_TYPED_DATA0_RGB) return saturate(TOON_TYPEDDATA0(BSDFContext.BSDF).rgb);
+	if (DebugMode == TOON_DEBUG_MODE_RUNTIME_TYPED_DATA0_A) return saturate(TOON_TYPEDDATA0(BSDFContext.BSDF).a).xxx;
+	if (DebugMode == TOON_DEBUG_MODE_RUNTIME_TYPED_DATA1_RGB) return saturate(TOON_TYPEDDATA1(BSDFContext.BSDF).rgb);
+	if (DebugMode == TOON_DEBUG_MODE_RUNTIME_TYPED_DATA1_A) return saturate(TOON_TYPEDDATA1(BSDFContext.BSDF).a).xxx;
+#endif
+	return CelData.ToonColor;
+}
+
+bool IsToonProfileDebugEnabled(in FSubstrateBSDF BSDF)
+{
+	return GetResolvedToonDebugMode(TOON_PROFILEID(BSDF), (float)GetSubstrateToonType(BSDF), TOON_MATERIALREGIONID(BSDF)) != TOON_DEBUG_MODE_NORMAL;
+}
+
+float3 EvaluateToonProfileCommonSpecularRimColor(in FSubstrateBSDFContext BSDFContext, FSubstrateIntegrationSettings Settings)
+{
+	const float ToonType = (float)GetSubstrateToonType(BSDFContext.BSDF);
+	const float Region = TOON_MATERIALREGIONID(BSDFContext.BSDF);
+	const FToonProfileSpecularRimData Profile = GetToonSpecularRimProfileData(TOON_PROFILEID(BSDFContext.BSDF), ToonType, Region);
+	const float Roughness = saturate(TOON_ROUGHNESS(BSDFContext.BSDF));
+	const float3 F0 = saturate(TOON_SPECULARCOLOR(BSDFContext.BSDF));
+	const float Width = saturate(Profile.SpecularSize * 0.5f + Roughness * 0.5f);
+	const float IsotropicInput = pow(saturate(BSDFContext.Context.NoH), exp2(lerp(7.0f, 1.5f, Width)));
+	const float Anisotropy = clamp(TOON_ANISOTROPY(BSDFContext.BSDF), -1.0f, 1.0f);
+	const float3 Axis = Anisotropy >= 0.0f ? BSDFContext.X : BSDFContext.Y;
+	const float TangentInput = saturate(1.0f - abs(dot(normalize(Axis), normalize(BSDFContext.H))));
+	const float Band = ToonProfileSmoothStep(saturate(Profile.SpecularThreshold), Profile.SpecularFeather, lerp(IsotropicInput, TangentInput, abs(Anisotropy)));
+	const float SpecularNoL = saturate(abs(BSDFContext.Context.NoL));
+	const float3 Specular = Band * SpecularNoL * max(Profile.SpecularIntensity, 0.0f) * max(Profile.SpecularColor, 0.0f) * F0;
+
+	float3 Rim = 0.0f;
+	if (Settings.bToonDirectionalLight)
+	{
+		const float ViewRim = pow(saturate(1.0f - BSDFContext.SatNoV), max(Profile.RimPower, 0.001f));
+		const float RimInput = ViewRim * lerp(1.0f, BSDFContext.SatNoL, saturate(Profile.RimLightAlign));
+		const float RimBand = ToonProfileSmoothStep(saturate(Profile.RimThreshold), Profile.RimFeather, RimInput);
+		Rim = RimBand * max(Profile.RimIntensity, 0.0f) * max(Profile.RimColor, 0.0f);
+	}
+	return Specular + Rim;
+}
+
+#include "SubstrateToonFace.ush"
+#include "SubstrateToonHair.ush"
+#include "SubstrateToonEye.ush"
+#include "SubstrateToonCloth.ush"
+
+float3 EvaluateToonProfileSpecularRimColor(in FSubstrateBSDFContext BSDFContext, FSubstrateIntegrationSettings Settings)
+{
+	const uint ToonType = GetSubstrateToonType(BSDFContext.BSDF);
+	if (GetResolvedToonDebugMode(TOON_PROFILEID(BSDFContext.BSDF), (float)ToonType, TOON_MATERIALREGIONID(BSDFContext.BSDF)) != TOON_DEBUG_MODE_NORMAL) return 0.0f;
+	if (ToonType == TOON_TYPE_FACE) return 0.0f;
+	if (ToonType == TOON_TYPE_HAIR) return EvaluateToonHairProfileSpecularRimColor(BSDFContext, Settings);
+	if (ToonType == TOON_TYPE_EYE) return EvaluateToonEyeProfileSpecularColor(BSDFContext);
+	if (ToonType == TOON_TYPE_CLOTH) return EvaluateToonClothProfileSpecularColor(BSDFContext);
+	return EvaluateToonProfileCommonSpecularRimColor(BSDFContext, Settings);
+}
+
+float3 EvaluateToonProfileDefaultCelColor(float3 DiffuseColor, in FSubstrateBSDFContext BSDFContext, FShadowTerms ShadowTerms, FSubstrateIntegrationSettings Settings)
+{
+	const float ToonProfileId = TOON_PROFILEID(BSDFContext.BSDF);
+	const float ToonType = (float)GetSubstrateToonType(BSDFContext.BSDF);
+	const float Region = TOON_MATERIALREGIONID(BSDFContext.BSDF);
+	const FToonProfileLightingData Lighting = GetToonLightingProfileData(ToonProfileId, ToonType, Region);
+	FToonProfileCelEvaluation CelData = BuildToonProfileCelData(DiffuseColor, BSDFContext, ShadowTerms, Lighting);
+	FinalizeToonProfileCelData(Lighting, ToonProfileId, ToonType, Region, Settings, CelData);
+	const uint DebugMode = GetResolvedToonDebugMode(ToonProfileId, ToonType, Region);
+	if (DebugMode == TOON_DEBUG_MODE_NORMAL) return CelData.ToonColor;
+	const float3 CommonDebug = EvaluateToonProfileDebugColor(DebugMode, CelData, BSDFContext);
+	const uint ResolvedType = GetSubstrateToonType(BSDFContext.BSDF);
+	if (ResolvedType == TOON_TYPE_HAIR) return EvaluateToonHairDebugColor(DebugMode, BSDFContext, Settings, CommonDebug);
+	if (ResolvedType == TOON_TYPE_CLOTH) return EvaluateToonClothDebugColor(DebugMode, BSDFContext, CommonDebug);
+	return CommonDebug;
+}
+
+float3 EvaluateToonProfileCelColor(float3 DiffuseColor, in FSubstrateBSDFContext BSDFContext, FShadowTerms ShadowTerms, FSubstrateIntegrationSettings Settings)
+{
+	const uint ToonType = GetSubstrateToonType(BSDFContext.BSDF);
+	if (ToonType == TOON_TYPE_FACE) return EvaluateToonFaceProfileCelColor(DiffuseColor, BSDFContext, ShadowTerms, Settings);
+	if (ToonType == TOON_TYPE_EYE) return EvaluateToonEyeProfileCelColor(DiffuseColor, BSDFContext, ShadowTerms, Settings);
+	return EvaluateToonProfileDefaultCelColor(DiffuseColor, BSDFContext, ShadowTerms, Settings);
+}
+
+struct FToonDirectResult
+{
+	float3 DiffuseColor;
+	float3 DiffusePathValue;
+	float3 IntegratedDiffuseValue;
+	float3 SpecularPathValue;
+	float3 IntegratedSpecularValue;
+	float DiffusePDF;
+	float SpecularPDF;
+};
+
+FToonDirectResult EvaluateToonDirectLighting(
+	float3 DiffuseColor,
+	in FSubstrateBSDFContext BSDFContext,
+	FShadowTerms ShadowTerms,
+	FAreaLight AreaLight,
+	FSubstrateIntegrationSettings Settings,
+	int IntegrationType)
+{
+	FToonDirectResult Result = (FToonDirectResult)0;
+	FSubstrateBSDFContext DiffuseContext = BSDFContext;
+	FSubstrateBSDFContext SpecularContext = BSDFContext;
+	const bool bAreaLight = IntegrationType == INTEGRATION_AREA_LIGHT_CAPSULE || IntegrationType == INTEGRATION_AREA_LIGHT_RECT;
+	if (bAreaLight)
+	{
+		// Area Light v1 is intentionally representative-direction Toon, not an
+		// integral of the discontinuous band response over the emitter surface.
+		if (dot(AreaLight.DiffuseL, AreaLight.DiffuseL) > 0.0001f)
+		{
+			DiffuseContext.SubstrateUpdateBSDFContext(normalize(AreaLight.DiffuseL));
+		}
+		if (dot(AreaLight.SpecularL, AreaLight.SpecularL) > 0.0001f)
+		{
+			SpecularContext.SubstrateUpdateBSDFContext(normalize(AreaLight.SpecularL));
+		}
+	}
+
+	const float3 ToonDiffuseColor = EvaluateToonProfileCelColor(DiffuseColor, DiffuseContext, ShadowTerms, Settings);
+	const bool bDebugMode = IsToonProfileDebugEnabled(BSDFContext.BSDF);
+	const float3 DirectAttenuation = AreaLight.Falloff * AreaLight.FalloffColor;
+
+	Result.DiffuseColor = ToonDiffuseColor;
+	Result.DiffusePathValue = bDebugMode ? ToonDiffuseColor : Diffuse_Lambert(ToonDiffuseColor);
+	Result.IntegratedDiffuseValue = bDebugMode ? ToonDiffuseColor : DirectAttenuation * Result.DiffusePathValue;
+	Result.DiffusePDF = DiffuseContext.SatNoL / PI;
+	if (!bDebugMode && GetSubstrateToonType(BSDFContext.BSDF) == TOON_TYPE_CLOTH)
+	{
+		const float ClothBaseEnergyScale = GetToonClothDirectBaseEnergyScale(SpecularContext);
+		Result.DiffuseColor *= ClothBaseEnergyScale;
+		Result.DiffusePathValue *= ClothBaseEnergyScale;
+		Result.IntegratedDiffuseValue *= ClothBaseEnergyScale;
+	}
+
+	Result.SpecularPathValue = EvaluateToonProfileSpecularRimColor(SpecularContext, Settings);
+	const float StableShadowNoL = GetSubstrateToonType(BSDFContext.BSDF) == TOON_TYPE_CLOTH
+		? GetToonClothFrame(SpecularContext).NoL
+		: saturate(abs(DiffuseContext.Context.NoL));
+	const float StableSurfaceShadow = ResolveToonStableSurfaceShadow(StableShadowNoL, ShadowTerms.SurfaceShadow);
+	Result.IntegratedSpecularValue = bDebugMode ? 0.0f.xxx : StableSurfaceShadow * DirectAttenuation * Result.SpecularPathValue;
+	Result.SpecularPDF = 1.0f;
+	return Result;
+}

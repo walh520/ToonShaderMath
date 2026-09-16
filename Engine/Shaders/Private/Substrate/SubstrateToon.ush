@@ -1,0 +1,75 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "SubstrateToonFaceFrame.ush"
+
+FSubstrateData GetSubstrateToonBSDF(
+	float3 BaseColor, float3 SpecularF0, float Roughness, float Anisotropy,
+	float3 Emissive,
+	float ToonProfileId,
+	float MaterialRegionId, float ShadowMask, float ShadingGradeMask, float ToonType,
+	float OutlineMask, float OutlineWidthScale,
+	float3 SpecialData0, float3 SpecialData1, float3 FaceRight, float3 FaceForward,
+	float3 EyeCorneaNormal,
+	float3 ToonDiffuseNormal, float bHasToonDiffuseNormal,
+	uint SharedLocalBasisIndex, inout uint SharedLocalBasisTypes)
+{
+	const uint ResolvedToonType = (uint)clamp(round(ToonType), 0.0f, 4.0f);
+	uint ToonOverrideFlags = ResolvedToonType;
+	float4 ToonTypedData0 = 0.0f;
+	float4 ToonTypedData1 = 0.0f;
+	float ToonDiffuseNormalOctX = 0.0f;
+	float AnisotropyOrFaceRightRoll = clamp(Anisotropy, -1.0f, 1.0f);
+
+	if (ResolvedToonType == TOON_TYPE_FACE)
+	{
+		const float3 SafeFaceForward = NormalizeToonFaceDirection(FaceForward, float3(1.0f, 0.0f, 0.0f));
+		const float2 EncodedFaceForward = PrepareToonFaceUNorm8ForStorage(UnitVectorToOctahedron(SafeFaceForward) * 0.5f + 0.5f);
+		const float3 StoredFaceForward = NormalizeToonFaceDirection(
+			OctahedronToUnitVector(ResolveToonFaceUNorm8(EncodedFaceForward) * 2.0f - 1.0f),
+			float3(1.0f, 0.0f, 0.0f));
+		ToonTypedData0 = float4(saturate(SpecialData0.xy), EncodedFaceForward);
+		ToonTypedData1 = float4(saturate(SpecialData1), 0.0f);
+		const float FaceRightRoll = EncodeToonFaceRightRoll(StoredFaceForward, FaceRight);
+		AnisotropyOrFaceRightRoll = PrepareToonFaceUNorm8ForStorage(FaceRightRoll * 0.5f + 0.5f) * 2.0f - 1.0f;
+	}
+	else if (ResolvedToonType == TOON_TYPE_HAIR)
+	{
+		ToonTypedData0 = saturate(float4(SpecialData0, SpecialData1.x));
+		ToonTypedData1.x = saturate(SpecialData1.y);
+	}
+	else if (ResolvedToonType == TOON_TYPE_EYE)
+	{
+		const float CorneaNormalLengthSquared = dot(EyeCorneaNormal, EyeCorneaNormal);
+		const float3 SafeCorneaNormal = CorneaNormalLengthSquared > 0.000001f
+			? EyeCorneaNormal * rsqrt(CorneaNormalLengthSquared)
+			: float3(0.0f, 0.0f, 1.0f);
+		const float2 EncodedCorneaNormal = UnitVectorToOctahedron(SafeCorneaNormal) * 0.5f + 0.5f;
+		ToonTypedData0 = float4(saturate(SpecialData0.xy), EncodedCorneaNormal);
+		ToonTypedData1.xy = saturate(float2(SpecialData0.z, SpecialData1.x));
+	}
+	else if (ResolvedToonType == TOON_TYPE_CLOTH)
+	{
+		ToonTypedData0 = float4(saturate(SpecialData0.x), 0.0f, 0.0f, 0.0f);
+	}
+
+	if (bHasToonDiffuseNormal > 0.5f)
+	{
+		const float NormalLengthSquared = dot(ToonDiffuseNormal, ToonDiffuseNormal);
+		const float3 SafeDiffuseNormal = NormalLengthSquared > 0.000001f
+			? ToonDiffuseNormal * rsqrt(NormalLengthSquared)
+			: float3(0.0f, 0.0f, 1.0f);
+		const float2 EncodedDiffuseNormal = UnitVectorToOctahedron(SafeDiffuseNormal) * 0.5f + 0.5f;
+		ToonDiffuseNormalOctX = EncodedDiffuseNormal.x;
+		ToonTypedData1.w = EncodedDiffuseNormal.y;
+		ToonOverrideFlags |= TOON_FLAG_HAS_DIFFUSE_NORMAL;
+	}
+
+	return GetSubstrateToonBSDFInternal(
+		BaseColor, saturate(SpecularF0), saturate(Roughness), AnisotropyOrFaceRightRoll,
+		Emissive,
+		ToonProfileId, MaterialRegionId, ShadowMask, ShadingGradeMask, (float)ToonOverrideFlags,
+		OutlineMask, OutlineWidthScale, ToonTypedData0, ToonTypedData1, ToonDiffuseNormalOctX,
+		SharedLocalBasisIndex, SharedLocalBasisTypes);
+}

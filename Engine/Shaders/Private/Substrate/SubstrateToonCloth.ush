@@ -1,0 +1,91 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+struct FToonClothFrame
+{
+	float3 N;
+	float NoL;
+	float NoV;
+	float NoH;
+};
+
+struct FToonClothDirectEvaluation
+{
+	float SheenSource;
+	float SheenBand;
+	float SheenCoverage;
+	float BaseEnergyScale;
+	float AdjustedRoughness;
+	float3 SheenColor;
+};
+
+FToonClothFrame GetToonClothFrame(in FSubstrateBSDFContext BSDFContext)
+{
+	FToonClothFrame Result;
+	// Flip the complete frame toward the viewer for two-sided cloth. Direct
+	// light then remains signed in that frame; abs(NoL) would incorrectly light
+	// both sides at once and break the Charlie/Neubelt visibility term.
+	const float FrameSign = dot(BSDFContext.N, BSDFContext.V) >= 0.0f ? 1.0f : -1.0f;
+	Result.N = BSDFContext.N * FrameSign;
+	Result.NoL = saturate(dot(Result.N, BSDFContext.L));
+	Result.NoV = saturate(dot(Result.N, BSDFContext.V));
+	Result.NoH = saturate(dot(Result.N, BSDFContext.H));
+	return Result;
+}
+
+float EvaluateToonCharlieSheen(float NoH, float NoL, float NoV, float Roughness)
+{
+	const float Alpha = max(Roughness * Roughness, 0.02f);
+	const float InvAlpha = rcp(Alpha);
+	const float SinThetaH = sqrt(saturate(1.0f - NoH * NoH));
+	const float CharlieD = (2.0f + InvAlpha) * pow(max(SinThetaH, 0.0001f), InvAlpha) / (2.0f * PI);
+	const float NeubeltVisibility = rcp(max(4.0f * (NoL + NoV - NoL * NoV), 0.0001f));
+	return saturate(CharlieD * NeubeltVisibility * NoL);
+}
+
+FToonClothDirectEvaluation EvaluateToonClothDirectData(in FSubstrateBSDFContext BSDFContext)
+{
+	FToonClothDirectEvaluation Result = (FToonClothDirectEvaluation)0;
+	const float ProfileId = TOON_PROFILEID(BSDFContext.BSDF);
+	const float Type = (float)TOON_TYPE_CLOTH;
+	const float Region = TOON_MATERIALREGIONID(BSDFContext.BSDF);
+	const FToonProfileClothData Cloth = GetToonClothProfileData(ProfileId, Type, Region);
+	const FToonClothFrame Frame = GetToonClothFrame(BSDFContext);
+	const float SpecularMask = saturate(TOON_TYPEDDATA0(BSDFContext.BSDF).r);
+	Result.AdjustedRoughness = saturate(TOON_ROUGHNESS(BSDFContext.BSDF) * Cloth.SheenRoughnessScale + Cloth.SheenRoughnessBias);
+	Result.BaseEnergyScale = 1.0f;
+	if (!Cloth.bSheenEnabled || Cloth.SheenIntensity <= 0.0f)
+	{
+		return Result;
+	}
+	Result.SheenSource = EvaluateToonCharlieSheen(Frame.NoH, Frame.NoL, Frame.NoV, Result.AdjustedRoughness);
+	const float SizedResponse = saturate(Result.SheenSource * max(Cloth.SheenSize, 0.0001f));
+	Result.SheenBand = ToonProfileSmoothStep(saturate(Cloth.SheenThreshold), Cloth.SheenFeather, SizedResponse);
+	Result.SheenCoverage = saturate(Result.SheenBand * SpecularMask);
+	Result.BaseEnergyScale = Cloth.EnergyMode == TOON_CLOTH_ENERGY_MODE_APPROXIMATE_LAYERED
+		? 1.0f - Result.SheenCoverage
+		: 1.0f;
+	Result.SheenColor = Result.SheenCoverage * max(Cloth.SheenIntensity, 0.0f)
+		* max(Cloth.SheenColor, 0.0f) * saturate(TOON_SPECULARCOLOR(BSDFContext.BSDF));
+	return Result;
+}
+
+float3 EvaluateToonClothDebugColor(uint DebugMode, in FSubstrateBSDFContext BSDFContext, float3 FallbackColor)
+{
+	const FToonClothDirectEvaluation Cloth = EvaluateToonClothDirectData(BSDFContext);
+	if (DebugMode == TOON_DEBUG_MODE_CLOTH_SHEEN_SOURCE) return Cloth.SheenSource.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_CLOTH_SHEEN_BAND) return Cloth.SheenBand.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_CLOTH_BASE_ENERGY) return Cloth.BaseEnergyScale.xxx;
+	return FallbackColor;
+}
+
+float GetToonClothDirectBaseEnergyScale(in FSubstrateBSDFContext BSDFContext)
+{
+	return EvaluateToonClothDirectData(BSDFContext).BaseEnergyScale;
+}
+
+float3 EvaluateToonClothProfileSpecularColor(in FSubstrateBSDFContext BSDFContext)
+{
+	return EvaluateToonClothDirectData(BSDFContext).SheenColor;
+}

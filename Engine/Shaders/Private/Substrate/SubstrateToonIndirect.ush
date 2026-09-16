@@ -1,0 +1,115 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+float3 GetToonIndirectAlbedo(in FSubstrateBSDF BSDF)
+{
+	const float Type = (float)GetSubstrateToonType(BSDF);
+	const float Region = TOON_MATERIALREGIONID(BSDF);
+	if (GetResolvedToonDebugMode(TOON_PROFILEID(BSDF), Type, Region) != TOON_DEBUG_MODE_NORMAL)
+	{
+		return 0.0f.xxx;
+	}
+	return GetToonTransportData(BSDF).DiffuseAlbedo;
+}
+
+float3 GetToonIndirectOcclusionAlbedo(in FSubstrateBSDF BSDF)
+{
+	return saturate(GetToonTransportData(BSDF).DiffuseAlbedo);
+}
+
+float3 StyleToonIncidentIndirectRadiance(in FSubstrateBSDF BSDF, float3 IncidentRadiance)
+{
+	const float Type = (float)GetSubstrateToonType(BSDF);
+	const float Region = TOON_MATERIALREGIONID(BSDF);
+	const FToonProfileIndirectData Indirect = GetToonIndirectProfileData(TOON_PROFILEID(BSDF), Type, Region);
+	const float3 Radiance = max(IncidentRadiance, 0.0f);
+	const float Luma = max(Luminance(Radiance), 0.0f);
+	const float3 EnvironmentColor = lerp(Luma.xxx, Radiance, saturate(Indirect.EnvironmentColorWeight));
+	const float HDRMappedLuma = Luma / (Luma + max(Indirect.HDRWhitePoint, 0.0001f));
+	const float3 RampTint = Indirect.bUseAmbientRamp
+		? SampleToonStyleRampTexture(TOON_PROFILEID(BSDF), Type, Region, HDRMappedLuma, true)
+		: 1.0f.xxx;
+	const float3 StyledEnvironment = EnvironmentColor * RampTint * max(Indirect.Intensity, 0.0f);
+	// Profile fill is authored in scene-referred units. Convert it to the same
+	// pre-exposed radiance domain as the engine's indirect-light inputs.
+	const float3 CharacterFill = max(Indirect.CharacterFillColor, 0.0f)
+		* max(Indirect.CharacterFillIntensity, 0.0f)
+		* View.PreExposure;
+	return max(StyledEnvironment + CharacterFill, 0.0f);
+}
+
+float3 ResolveToonIndirectVisibility(in FSubstrateBSDF BSDF, float EngineAO)
+{
+	const float Type = (float)GetSubstrateToonType(BSDF);
+	const FToonProfileIndirectData Indirect = GetToonIndirectProfileData(TOON_PROFILEID(BSDF), Type, TOON_MATERIALREGIONID(BSDF));
+	const float WeightedAO = lerp(1.0f, saturate(EngineAO), saturate(Indirect.AOWeight));
+	return AOMultiBounce(GetToonIndirectOcclusionAlbedo(BSDF), WeightedAO);
+}
+
+struct FToonLumenEvaluationData
+{
+	float3 DiffuseColor;
+	float3 ReflectionF0;
+	float ReflectionRoughness;
+	float ReflectionScale;
+	float3 ReflectionPostTint;
+	float3 ReflectionNormal;
+	float3 ReflectionDirection;
+	float ReflectionNoV;
+};
+
+FToonLumenEvaluationData EvaluateToonProfileLumenData(in FSubstrateBSDFContext BSDFContext)
+{
+	FToonLumenEvaluationData Result;
+	const float Type = (float)GetSubstrateToonType(BSDFContext.BSDF);
+	const float Region = TOON_MATERIALREGIONID(BSDFContext.BSDF);
+	const FToonProfileIndirectData Indirect = GetToonIndirectProfileData(TOON_PROFILEID(BSDFContext.BSDF), Type, Region);
+	const FToonTransportData Transport = GetToonTransportData(BSDFContext.BSDF);
+	Result.DiffuseColor = GetToonIndirectAlbedo(BSDFContext.BSDF);
+	Result.ReflectionF0 = Transport.F0;
+	Result.ReflectionRoughness = Transport.Roughness;
+	Result.ReflectionScale = max(Indirect.ReflectionIntensity, 0.0f);
+	Result.ReflectionPostTint = max(Indirect.ReflectionTint, 0.0f);
+	Result.ReflectionNormal = BSDFContext.N;
+	Result.ReflectionDirection = BSDFContext.R;
+	Result.ReflectionNoV = saturate(BSDFContext.Context.NoV);
+
+	if ((uint)Type == TOON_TYPE_HAIR)
+	{
+		const FToonProfileHairData Hair = GetToonHairProfileData(TOON_PROFILEID(BSDFContext.BSDF), Type, Region);
+		const float3 StrandTangent = normalize(BSDFContext.X);
+		const float3 RadialView = BSDFContext.V - StrandTangent * dot(BSDFContext.V, StrandTangent);
+		Result.ReflectionNormal = dot(RadialView, RadialView) > 0.0001f ? normalize(RadialView) : BSDFContext.N;
+		Result.ReflectionDirection = reflect(-BSDFContext.V, Result.ReflectionNormal);
+		Result.ReflectionNoV = saturate(dot(Result.ReflectionNormal, BSDFContext.V));
+		Result.ReflectionRoughness = max(Result.ReflectionRoughness, saturate(Hair.WideWidth));
+	}
+	else if ((uint)Type == TOON_TYPE_EYE)
+	{
+		Result.ReflectionNormal = GetToonEyeCorneaNormal(BSDFContext.BSDF);
+		Result.ReflectionDirection = reflect(-BSDFContext.V, Result.ReflectionNormal);
+		Result.ReflectionNoV = saturate(dot(Result.ReflectionNormal, BSDFContext.V));
+	}
+	else if ((uint)Type == TOON_TYPE_CLOTH)
+	{
+		const FToonProfileClothData Cloth = GetToonClothProfileData(TOON_PROFILEID(BSDFContext.BSDF), Type, Region);
+		const FToonClothFrame Frame = GetToonClothFrame(BSDFContext);
+		Result.ReflectionNormal = Frame.N;
+		Result.ReflectionDirection = reflect(-BSDFContext.V, Frame.N);
+		Result.ReflectionNoV = Frame.NoV;
+		if (Cloth.bSheenEnabled && Cloth.SheenIntensity > 0.0f)
+		{
+			const float SheenMask = saturate(TOON_TYPEDDATA0(BSDFContext.BSDF).r);
+			Result.ReflectionRoughness = max(saturate(TOON_ROUGHNESS(BSDFContext.BSDF) * Cloth.SheenRoughnessScale + Cloth.SheenRoughnessBias), 0.35f);
+			Result.ReflectionPostTint *= lerp(1.0f.xxx, max(Cloth.SheenColor, 0.0f), SheenMask);
+			Result.ReflectionScale *= lerp(1.0f, 1.0f + max(Cloth.SheenIntensity, 0.0f), SheenMask);
+		}
+	}
+	if (GetResolvedToonDebugMode(TOON_PROFILEID(BSDFContext.BSDF), Type, Region) != TOON_DEBUG_MODE_NORMAL)
+	{
+		Result.ReflectionF0 = 0.0f;
+		Result.ReflectionScale = 0.0f;
+	}
+	return Result;
+}

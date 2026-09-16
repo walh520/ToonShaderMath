@@ -1,0 +1,129 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "SubstrateToonFaceFrame.ush"
+
+struct FToonFaceFrame
+{
+	float3 Forward;
+	float3 Right;
+	float3 Up;
+};
+
+struct FToonFaceSDFEvaluation
+{
+	float SelectedSDF;
+	float LightCosine;
+	float SideResponse;
+	float OverheadResponse;
+	float PlanarWeight;
+	float Response;
+};
+
+FToonFaceFrame GetToonFaceFrame(float4 FaceRuntimeData, float FaceRightRoll)
+{
+	FToonFaceFrame Result;
+	DecodeToonFaceFrame(FaceRuntimeData.zw, FaceRightRoll, Result.Forward, Result.Right, Result.Up);
+	return Result;
+}
+
+FToonFaceSDFEvaluation EvaluateToonFaceSDF(
+	FToonProfileFaceData FaceData,
+	in FSubstrateBSDFContext BSDFContext,
+	FToonFaceFrame FaceFrame,
+	float2 FaceSDF)
+{
+	FToonFaceSDFEvaluation Result = (FToonFaceSDFEvaluation)0;
+	const float2 PlanarLight = float2(dot(BSDFContext.L, FaceFrame.Right), dot(BSDFContext.L, FaceFrame.Forward));
+	const float PlanarLength = length(PlanarLight);
+	const float2 LightDirection = PlanarLight / max(PlanarLength, 0.0001f);
+	const bool bUseLeftSDF = FaceData.bFlipFaceSDFByLight ? LightDirection.x < 0.0f : LightDirection.x >= 0.0f;
+	Result.SelectedSDF = bUseLeftSDF ? FaceSDF.y : FaceSDF.x;
+
+	// Face SDF is authored in a cosine domain. This is continuous across the
+	// front/back sweep and avoids a per-pixel acos in every direct-light pass.
+	Result.LightCosine = saturate(LightDirection.y * 0.5f + 0.5f + FaceData.FaceShadowCosineOffset);
+	Result.SideResponse = ToonProfileSmoothStepQuantized(Result.SelectedSDF, FaceData.FaceShadowFeather, 1.0f / 255.0f, Result.LightCosine);
+
+	// When the key light approaches the face Up axis, the projected direction
+	// becomes ill-conditioned. Blend to an explicit top/bottom response instead.
+	const float VerticalLight = dot(BSDFContext.L, FaceFrame.Up);
+	const float TopBlend = smoothstep(-0.05f, 0.05f, VerticalLight);
+	Result.OverheadResponse = lerp(FaceData.BottomLightValue, FaceData.TopLightValue, TopBlend);
+	Result.PlanarWeight = smoothstep(FaceData.OverheadBlendStart, FaceData.OverheadBlendEnd, saturate(PlanarLength));
+	Result.Response = lerp(Result.OverheadResponse, Result.SideResponse, Result.PlanarWeight);
+	return Result;
+}
+
+float3 EvaluateToonFaceDebugColor(
+	uint DebugMode,
+	FToonFaceFrame FaceFrame,
+	FToonFaceSDFEvaluation SDF,
+	float RealtimeShadowCap,
+	float DetailGradeCap,
+	float3 FallbackColor)
+{
+	if (DebugMode == TOON_DEBUG_MODE_FACE_FRAME) return FaceFrame.Forward * 0.5f + 0.5f;
+	if (DebugMode == TOON_DEBUG_MODE_FACE_SDF_SELECTED) return SDF.SelectedSDF.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_FACE_LIGHT_COSINE) return SDF.LightCosine.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_FACE_REALTIME_SHADOW_CAP) return RealtimeShadowCap.xxx;
+	if (DebugMode == TOON_DEBUG_MODE_FACE_DETAIL_GRADE) return DetailGradeCap.xxx;
+	return FallbackColor;
+}
+
+float3 EvaluateToonFaceProfileCelColor(float3 DiffuseColor, in FSubstrateBSDFContext BSDFContext, FShadowTerms ShadowTerms, FSubstrateIntegrationSettings Settings)
+{
+	const float ToonProfileId = TOON_PROFILEID(BSDFContext.BSDF);
+	const float ToonType = (float)TOON_TYPE_FACE;
+	const float Region = TOON_MATERIALREGIONID(BSDFContext.BSDF);
+	const FToonProfileLightingData Lighting = GetToonLightingProfileData(ToonProfileId, ToonType, Region);
+	const FToonProfileFaceData FaceData = GetToonFaceProfileData(ToonProfileId, ToonType, Region);
+	const float4 FaceRuntimeData = TOON_TYPEDDATA0(BSDFContext.BSDF);
+	const float3 DetailMasks = TOON_TYPEDDATA1(BSDFContext.BSDF).rgb;
+	const FToonFaceFrame FaceFrame = GetToonFaceFrame(FaceRuntimeData, TOON_FACE_RIGHT_ROLL(BSDFContext.BSDF));
+	const FToonFaceSDFEvaluation SDF = EvaluateToonFaceSDF(FaceData, BSDFContext, FaceFrame, FaceRuntimeData.xy);
+	FToonProfileCelEvaluation CelData = BuildToonProfileCelData(DiffuseColor, BSDFContext, ShadowTerms, Lighting);
+
+	float DetailGradeCap = 1.0f;
+	if (Settings.bToonDirectionalLight)
+	{
+		const float PhysicalResponse = CelData.CelInput;
+		float SDFTarget = min(PhysicalResponse, SDF.Response);
+		if (FaceData.FaceSDFMode == TOON_FACE_SDF_MODE_BLEND)
+		{
+			SDFTarget = lerp(PhysicalResponse, SDF.Response, 0.5f);
+		}
+		else if (FaceData.FaceSDFMode == TOON_FACE_SDF_MODE_REPLACE)
+		{
+			SDFTarget = SDF.Response;
+		}
+		CelData.CelInput = lerp(PhysicalResponse, SDFTarget, saturate(FaceData.FaceSDFWeight));
+
+		// Detail masks are strictly darkening caps even when SDF mode is Replace.
+		const float SideLight = saturate(abs(dot(BSDFContext.L, FaceFrame.Right)));
+		const float ViewGrazing = saturate(1.0f - abs(dot(BSDFContext.V, FaceFrame.Forward)));
+		const float NoseCap = saturate(1.0f - DetailMasks.r * max(FaceData.NoseShadowStrength, 0.0f) * SideLight);
+		const float EyeSocketCap = saturate(1.0f - DetailMasks.g * max(FaceData.EyeSocketShadowStrength, 0.0f) * ViewGrazing);
+		const float CheekCap = saturate(1.0f - DetailMasks.b * max(FaceData.CheekGradeStrength, 0.0f));
+		DetailGradeCap = min(NoseCap, min(EyeSocketCap, CheekCap));
+		CelData.CelInput = min(CelData.CelInput, DetailGradeCap);
+	}
+
+	const float RealtimeShadowCap = lerp(1.0f, CelData.StableSurfaceShadow, saturate(FaceData.FaceRealtimeShadowWeight));
+	CelData.CelInput = min(CelData.CelInput, RealtimeShadowCap);
+	FinalizeToonProfileCelData(Lighting, ToonProfileId, ToonType, Region, Settings, CelData);
+
+	// Punctual/area lights are deliberately fill-only for Face. The key-light
+	// SDF remains stable and local lights cannot replace or re-steer it.
+	if (!Settings.bToonDirectionalLight)
+	{
+		CelData.ToonColor *= saturate(FaceData.LocalLightFillWeight);
+	}
+
+	const uint DebugMode = GetResolvedToonDebugMode(ToonProfileId, ToonType, Region);
+	const float3 CommonDebug = EvaluateToonProfileDebugColor(DebugMode, CelData, BSDFContext);
+	return DebugMode == TOON_DEBUG_MODE_NORMAL
+		? CelData.ToonColor
+		: EvaluateToonFaceDebugColor(DebugMode, FaceFrame, SDF, RealtimeShadowCap, DetailGradeCap, CommonDebug);
+}
